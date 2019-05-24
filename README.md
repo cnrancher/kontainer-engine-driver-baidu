@@ -16,12 +16,12 @@ release and can be downloaded from one of those URLs directly.
 
 ## Running
 
-Go to the `Cluster Drivers` management screen in Rancher and click 
-`Add Cluster Driver`. Enter the URL of your driver, a UI URL (see the UI 
-[skel repo](https://github.com/rancher/ui-cluster-driver-skel) for details), and a 
-checksum (optional), and click `Create`. Rancher will automatically download 
-and install your driver. It will then become available to use on the 
-`Add Cluster` screen.
+1. Go to the `Cluster Drivers` management screen in Rancher and click `Add Cluster Driver`.
+2. Enter Download URL at release page.
+3. Enter the Custom UI URL with value `https://cluster-driver.oss-cn-beijing.aliyuncs.com/baidu/ui/component.js`.
+4. Add Whitelist Domains with value `*.aliyuncs.com` and `*.baidubce.com`.
+5. Click `Create`, and wait for driver status to be `Active`.
+6. Baidu Driver will be available to use on the `Add Cluster` screen.
 
 ## License
 Copyright (c) 2018 [Rancher Labs, Inc.](http://rancher.com)

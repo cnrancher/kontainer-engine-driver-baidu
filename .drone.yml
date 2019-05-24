@@ -16,7 +16,6 @@ pipeline:
       - sha256
     secrets: [github_token]
     when:
-      branch: master
       event: tag
       ref:
         exclude: [ refs/tags/*rc* ]
@@ -30,7 +29,6 @@ pipeline:
       - sha256
     secrets: [github_token]
     when:
-      branch: master
       event: tag
       ref:
         include: [ refs/tags/*rc* ]

@@ -105,6 +105,8 @@ type BCCConfig struct {
 	InstanceType        int64               `json:"instanceType"`
 	LogicalZone         string              `json:"logicalZone"`
 	BandwidthInMbps     int64               `json:"bandwidthInMbps"`
+	GPUCard             string              `json:"gpuCard"`
+	GPUCount            int64               `json:"gpuCount"`
 	CPU                 int64               `json:"cpu"`
 	Memory              int64               `json:"memory"`
 	ImageType           string              `json:"imageType"`
@@ -459,4 +461,52 @@ func (c *Client) GetKubeConfig(clusterUUID string, option *bce.SignOption) (stri
 		return "", err
 	}
 	return respArgs.Data, nil
+}
+
+type ClusterUpgradeArgs struct {
+	ClusterUUID string `json:"clusterUuid"`
+	Version     string `json:"version"`
+}
+
+func (args *ClusterUpgradeArgs) validate() error {
+	if args == nil {
+		return fmt.Errorf("CreateClusterArgs cannot be nil")
+	}
+	if args.ClusterUUID == "" {
+		return fmt.Errorf("cluster id cannot be empty")
+	}
+	if args.Version == "" {
+		return fmt.Errorf("version cannot be empty")
+	}
+	return nil
+}
+
+func (c *Client) ClusterUpgrade(clusterUUID, version string, option *bce.SignOption) error {
+	args := &ClusterUpgradeArgs{
+		ClusterUUID: clusterUUID,
+		Version:     version,
+	}
+	err := args.validate()
+	if err != nil {
+		return err
+	}
+	postContent, err := json.Marshal(args)
+	if err != nil {
+		return err
+	}
+	req, err := bce.NewRequest("POST", c.GetURL("v1/cluster/cluster_upgrade/upgrade", nil), bytes.NewBuffer(postContent))
+	if err != nil {
+		return err
+	}
+	resp, err := c.SendRequest(req, option)
+	if err != nil {
+		return err
+	}
+
+	_, err = resp.GetBodyContent()
+	if err != nil {
+		return err
+	}
+
+	return nil
 }

@@ -4,13 +4,13 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"github.com/baidu/baiducloud-sdk-go/bce"
-	"github.com/baidu/baiducloud-sdk-go/cce"
-	"github.com/baidu/baiducloud-sdk-go/eip"
-	"k8s.io/client-go/rest"
 	"strings"
 	"time"
 
+	"github.com/baidu/baiducloud-sdk-go/bce"
+	"github.com/baidu/baiducloud-sdk-go/cce"
+	"github.com/baidu/baiducloud-sdk-go/cds"
+	"github.com/baidu/baiducloud-sdk-go/eip"
 	"github.com/rancher/kontainer-engine/drivers/options"
 	"github.com/rancher/kontainer-engine/drivers/util"
 	"github.com/rancher/kontainer-engine/types"
@@ -18,6 +18,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
@@ -60,6 +61,8 @@ type state struct {
 	Memory            int64
 	InstanceType      int64
 	CDSConfig         []string
+	GPUCard           string
+	GPUCount          int64
 
 	NodeCount int64
 	// cluster info
@@ -93,10 +96,6 @@ func (d *Driver) GetDriverCreateOptions(ctx context.Context) (*types.DriverFlags
 	driverFlag.Options["cluster-name"] = &types.Flag{
 		Type:  types.StringType,
 		Usage: "The name of the cluster that should be displayed to the user",
-	}
-	driverFlag.Options["project-id"] = &types.Flag{
-		Type:  types.StringType,
-		Usage: "the ID of your project to use when creating a cluster",
 	}
 	driverFlag.Options["zone"] = &types.Flag{
 		Type:  types.StringType,
@@ -213,6 +212,18 @@ func (d *Driver) GetDriverCreateOptions(ctx context.Context) (*types.DriverFlags
 			DefaultStringSlice: &types.StringSlice{Value: []string{}}, //avoid nil value for init
 		},
 	}
+	driverFlag.Options["gpu-card"] = &types.Flag{
+		Type:  types.StringType,
+		Usage: "GPU type for BCC config",
+	}
+	driverFlag.Options["gpu-count"] = &types.Flag{
+		Type:  types.IntType,
+		Usage: "GPU count for BCC config",
+	}
+	driverFlag.Options["disk-size"] = &types.Flag{
+		Type:  types.IntType,
+		Usage: "Disk size for GPU type BCC",
+	}
 
 	return &driverFlag, nil
 }
@@ -221,6 +232,10 @@ func (d *Driver) GetDriverCreateOptions(ctx context.Context) (*types.DriverFlags
 func (d *Driver) GetDriverUpdateOptions(ctx context.Context) (*types.DriverFlags, error) {
 	driverFlag := types.DriverFlags{
 		Options: make(map[string]*types.Flag),
+	}
+	driverFlag.Options["cluster-version"] = &types.Flag{
+		Type:  types.StringType,
+		Usage: "The version of cluster",
 	}
 	driverFlag.Options["zone"] = &types.Flag{
 		Type:  types.StringType,
@@ -344,6 +359,9 @@ func getStateFromOpts(driverOptions *types.DriverOptions) (*state, error) {
 	d.BandwidthInMbps = options.GetValueFromDriverOptions(driverOptions, types.IntType, "bandwidth-in-mbps", "bandwidthInMbps").(int64)
 	d.CDSConfig = options.GetValueFromDriverOptions(driverOptions, types.StringSliceType, "cds-config", "cdsConfig").(*types.StringSlice).Value
 	d.InstanceType = options.GetValueFromDriverOptions(driverOptions, types.IntType, "instance-type", "instanceType").(int64)
+	d.DiskSize = options.GetValueFromDriverOptions(driverOptions, types.IntType, "disk-size", "diskSize").(int64)
+	d.GPUCard = options.GetValueFromDriverOptions(driverOptions, types.StringType, "gpu-card", "gpuCard").(string)
+	d.GPUCount = options.GetValueFromDriverOptions(driverOptions, types.IntType, "gpu-count", "gpuCount").(int64)
 
 	return d, d.validate()
 }
@@ -434,11 +452,11 @@ func (d *Driver) Update(ctx context.Context, info *types.ClusterInfo, opts *type
 		return nil, err
 	}
 
+	client, err := getServiceClient(state)
+	if err != nil {
+		return info, err
+	}
 	if state.NodeCount != updateState.NodeCount {
-		client, err := getServiceClient(state)
-		if err != nil {
-			return info, err
-		}
 		args := &cce.GetClusterNodesArgs{
 			ClusterUUID: state.ClusterID,
 			Marker:      "-1",
@@ -469,21 +487,45 @@ func (d *Driver) Update(ctx context.Context, info *types.ClusterInfo, opts *type
 				return nil, fmt.Errorf("total count of current cluster nodes is %d, fail to remove requested value of %d",
 					clusterNodeCount, deleteCount)
 			}
-			var instanceIds = make([]cce.NodeInfo, updateState.NodeCount)
+			var instanceIds = make([]cce.NodeInfo, deleteCount)
 			removeNodes := nodeList[:deleteCount]
 			for i, node := range removeNodes {
 				instanceIds[i].InstanceID = node.InstanceShortID
 			}
 
-			req := &cce.ScalingDownClusterArgs{
-				ClusterUUID: state.ClusterID,
-				NodeInfo:    instanceIds,
+			// detach all cds disks and remove them
+			cdsClient, err := getCDSClient(state)
+			for _, node := range removeNodes {
+				zoneName := node.AvailableZone[len(node.AvailableZone)-1:]
+				getVolumeArgs := &cds.GetVolumeListArgs{
+					InstanceId: node.InstanceShortID,
+					ZoneName:   fmt.Sprintf("cn-%s-%s", state.Region, strings.ToLower(zoneName)),
+				}
+				volumeList, err := cdsClient.GetVolumeList(getVolumeArgs, nil)
+				if err != nil {
+					return nil, err
+				}
+				for _, volume := range volumeList {
+					if !volume.IsSystemVolume {
+						detachVolumeArgs := &cds.AttachVolumeArgs{
+							VolumeId:   volume.Id,
+							InstanceId: node.InstanceShortID,
+						}
+						err = cdsClient.DetachVolume(detachVolumeArgs, nil)
+						if err != nil {
+							return nil, err
+						}
+						err = d.waitForVolumeStatus(ctx, cdsClient, volume.Id, cds.VOLUMESTATUS_AVAILABLE)
+						if err != nil {
+							return nil, err
+						}
+						err = cdsClient.DeleteVolume(volume.Id, nil)
+						if err != nil {
+							return nil, err
+						}
+					}
+				}
 			}
-			err = client.ScalingDownCluster(req, nil)
-			if err != nil {
-				return nil, err
-			}
-			logrus.Infof("delete total %d nodes of cluster %v", deleteCount, state.ClusterID)
 
 			eipClient, err := getEipClient(state)
 			if err != nil {
@@ -503,13 +545,41 @@ func (d *Driver) Update(ctx context.Context, info *types.ClusterInfo, opts *type
 					return nil, err
 				}
 			}
+
+			// scaling down cluster
+			req := &cce.ScalingDownClusterArgs{
+				ClusterUUID: state.ClusterID,
+				NodeInfo:    instanceIds,
+			}
+			err = client.ScalingDownCluster(req, nil)
+			if err != nil {
+				return nil, err
+			}
+			logrus.Infof("delete total %d nodes of cluster %v", deleteCount, state.ClusterID)
 			if err := d.waitBaiduCluster(ctx, client, state); err != nil {
 				return info, err
 			}
 		}
 		state.NodeCount = currentCount
 	}
+
+	// upgrade cluster
+	if versionGreaterThan(updateState.ClusterVersion, state.ClusterVersion) {
+		logrus.Infof("updating kubernetes version to %q", updateState.ClusterVersion)
+		state.ClusterVersion = updateState.ClusterVersion
+		if err := upgradeCluster(client, state); err != nil {
+			return info, err
+		}
+		if err := d.waitBaiduCluster(ctx, client, state); err != nil {
+			return info, err
+		}
+	}
+
 	return info, storeState(info, state)
+}
+
+func upgradeCluster(client *cce.Client, state *state) error {
+	return client.ClusterUpgrade(state.ClusterID, state.ClusterVersion, nil)
 }
 
 func generateScalingUpRequest(clusterID string, state *state) *cce.ScalingUpClusterArgs {
@@ -599,6 +669,8 @@ func generateOrderContent(state *state) *cce.BaseCreateOrderRequestVo {
 		EIPName:           state.EIPName,
 		BandwidthInMbps:   state.BandwidthInMbps,
 		AutoRenew:         false,
+		GPUCard:           state.GPUCard,
+		GPUCount:          state.GPUCount,
 	}
 	bccRequest.ProductType = cce.PostPayProductType
 	bccRequest.Region = state.Region
@@ -691,6 +763,41 @@ func (d *Driver) Remove(ctx context.Context, info *types.ClusterInfo) error {
 		return err
 	}
 
+	// detach all cds disks and remove them
+	cdsClient, err := getCDSClient(state)
+	for _, node := range nodeList {
+		zoneName := node.AvailableZone[len(node.AvailableZone)-1:]
+		getVolumeArgs := &cds.GetVolumeListArgs{
+			InstanceId: node.InstanceShortID,
+			ZoneName:   fmt.Sprintf("cn-%s-%s", state.Region, strings.ToLower(zoneName)),
+		}
+		volumeList, err := cdsClient.GetVolumeList(getVolumeArgs, nil)
+		if err != nil {
+			return err
+		}
+		for _, volume := range volumeList {
+			if !volume.IsSystemVolume {
+				detachVolumeArgs := &cds.AttachVolumeArgs{
+					VolumeId:   volume.Id,
+					InstanceId: node.InstanceShortID,
+				}
+				err = cdsClient.DetachVolume(detachVolumeArgs, nil)
+				if err != nil {
+					return err
+				}
+				err = d.waitForVolumeStatus(ctx, cdsClient, volume.Id, cds.VOLUMESTATUS_AVAILABLE)
+				if err != nil {
+					return err
+				}
+				err = cdsClient.DeleteVolume(volume.Id, nil)
+				if err != nil {
+					logrus.Infof("delete volume error %v", err)
+					return err
+				}
+			}
+		}
+	}
+
 	eipClient, err := getEipClient(state)
 	if err != nil {
 		return err
@@ -746,6 +853,19 @@ func getEipClient(state *state) (*eip.Client, error) {
 	return client, nil
 }
 
+func getCDSClient(state *state) (*cds.Client, error) {
+	cred := bce.NewCredentials(state.AccessKey, state.SecretKey)
+	bceConf := &bce.Config{
+		Credentials: cred,
+		Checksum:    true,
+		Timeout:     20 * time.Second,
+		Region:      state.Region,
+		Protocol:    "https",
+	}
+	client := cds.NewClient(bceConf)
+	return client, nil
+}
+
 func getClientset(info *types.ClusterInfo) (*kubernetes.Clientset, error) {
 	state, err := getState(info)
 	if err != nil {
@@ -792,18 +912,52 @@ func getClientset(info *types.ClusterInfo) (*kubernetes.Clientset, error) {
 
 func (d *Driver) waitBaiduCluster(ctx context.Context, client *cce.Client, state *state) error {
 	lastMsg := ""
+	timeout := time.Duration(30 * time.Minute)
+	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
+	tick := TickerContext(timeoutCtx, 15*time.Second)
+	defer cancel()
+
 	for {
-		cluster, err := client.DescribeCluster(state.ClusterID, nil)
+		select {
+		// Got a timeout! fail with a timeout error
+		case <-timeoutCtx.Done():
+			return fmt.Errorf("timed out waiting cluster %s to be ready", state.ClusterName)
+		// Got a tick, check cluster provisioning status
+		case <-tick:
+			cluster, err := client.DescribeCluster(state.ClusterID, nil)
+			if err != nil {
+				return err
+			}
+
+			if cluster.Status != lastMsg {
+				log.Infof(ctx, "%v cluster %v......", strings.ToLower(cluster.Status), state.ClusterName)
+				lastMsg = cluster.Status
+			}
+
+			if cluster.Status == cce.ClusterStatusRunning {
+				log.Infof(ctx, "Cluster %v is running", state.ClusterName)
+				return nil
+			} else if cluster.Status == cce.ClusterStatusCreateFailed || cluster.Status == cce.ClusterStatusError {
+				return fmt.Errorf("baidu cloud failed to provision cluster: %s", cluster.ClusterUUID)
+			}
+		}
+	}
+}
+
+func (d *Driver) waitForVolumeStatus(ctx context.Context, client *cds.Client, id string, status cds.VolumeStatus) error {
+	var lastMsg cds.VolumeStatus
+	for {
+		volume, err := client.DescribeVolume(id, nil)
 		if err != nil {
 			return err
 		}
-		if cluster.Status == cce.ClusterStatusRunning {
-			log.Infof(ctx, "Cluster %v is running", state.ClusterName)
+		if volume.Status == status {
+			logrus.Debugf("volume %v is %v", volume.Name, status)
 			return nil
 		}
-		if cluster.Status != lastMsg {
-			log.Infof(ctx, "%v cluster %v......", strings.ToLower(cluster.Status), state.ClusterName)
-			lastMsg = cluster.Status
+		if volume.Status != lastMsg {
+			logrus.Debugf("volume %v status is %v", volume.Name, volume.Status)
+			lastMsg = volume.Status
 		}
 		time.Sleep(time.Second * 5)
 	}
@@ -865,7 +1019,27 @@ func (d *Driver) GetVersion(ctx context.Context, info *types.ClusterInfo) (*type
 }
 
 func (d *Driver) SetVersion(ctx context.Context, info *types.ClusterInfo, version *types.KubernetesVersion) error {
-	logrus.Info("unimplemented")
+	state, err := getState(info)
+	if err != nil {
+		return err
+	}
+
+	if versionGreaterThan(version.GetVersion(), state.ClusterVersion) {
+		logrus.Infof("updating kubernetes version to %q", version.GetVersion())
+		client, err := getServiceClient(state)
+		if err != nil {
+			return err
+		}
+		state.ClusterVersion = version.GetVersion()
+		if err := upgradeCluster(client, state); err != nil {
+			return err
+		}
+		if err := d.waitBaiduCluster(ctx, client, state); err != nil {
+			return err
+		}
+		logrus.Infof("cluster updated to version %q successfully", version.GetVersion())
+	}
+
 	return nil
 }
 

@@ -17,8 +17,8 @@ release and can be downloaded from one of those URLs directly.
 ## Running
 
 1. Go to the `Cluster Drivers` management screen in Rancher and click `Add Cluster Driver`.
-2. Enter Download URL at release page.
-3. Enter the Custom UI URL with value `https://cluster-driver.oss-cn-beijing.aliyuncs.com/baidu/ui/component.js`.
+2. Enter Download URL `https://cluster-driver.oss-cn-shenzhen.aliyuncs.com/baidu/linux/kontainer-engine-driver-baidu-linux`
+3. Enter the Custom UI URL with value `https://cluster-driver.oss-cn-shenzhen.aliyuncs.com/baidu/ui/component.js`.
 4. Add Whitelist Domains with value `*.aliyuncs.com` and `*.baidubce.com`.
 5. Click `Create`, and wait for driver status to be `Active`.
 6. Baidu Driver will be available to use on the `Add Cluster` screen.
